@@ -1,13 +1,4 @@
-"previews": {
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "ROOM",
-        "class_name": "Room"
-      }
-    ]
-  }
-}
+
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "screen-projection",
