@@ -1,9 +1,10 @@
 
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "screen-projection",
+  "name": "screen",
   "main": "worker.js",
   "compatibility_date": "2026-11-06",
+
   "durable_objects": {
     "bindings": [
       {
@@ -12,10 +13,22 @@
       }
     ]
   },
+
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["Room"]
     }
-  ]
+  ],
+
+  "previews": {
+    "durable_objects": {
+      "bindings": [
+        {
+          "name": "ROOM",
+          "class_name": "Room"
+        }
+      ]
+    }
+  }
 }
