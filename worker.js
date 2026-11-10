@@ -1,4 +1,3 @@
-
 import { DurableObject } from "cloudflare:workers";
 
 const PAGE = String.raw`<!doctype html>
@@ -21,6 +20,7 @@ button{cursor:pointer}button.primary{background:var(--accent);border-color:var(-
 button:disabled,select:disabled{opacity:.45;cursor:not-allowed}
 #count,#quality{font-size:.82rem;color:var(--muted);margin:8px 0}
 video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:contain;background:#050505;border-radius:10px}
+@media (orientation:landscape) and (min-width:601px){video{width:min(100%,760px);max-height:58vh;margin-inline:auto}}
 #files{margin-top:16px;padding:14px;background:var(--panel);border:1px solid var(--line);border-radius:12px}
 #drop{border:1.5px dashed var(--line);border-radius:9px;padding:18px 12px;text-align:center;color:var(--muted);cursor:pointer;outline:none}
 #drop.drag{border-color:var(--accent);background:var(--soft)}
@@ -64,6 +64,7 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
   const MAX_FILE = 100 * 1024 * 1024, CHUNK = 16 * 1024, HIGH_WATER = 1024 * 1024;
   const decoder = new TextDecoder(), encoder = new TextEncoder();
   let ws = null, clientId, peerId = null, pc = null, dataChannel = null, localStream = null;
+  let filePc = null, fileDataChannel = null, filePendingCandidates = [], fileMakingOffer = false;
   let pendingCandidates = [], reconnectTimer = null, reconnectDelay = 1000, heartbeatTimer = null;
   let lastPong = Date.now(), busy = false, sharing = false, remoteSharing = false, makingOffer = false;
   let restartTimer = null, statsTimer = null, lastVideoStats = null, captureHasAudio = false;
@@ -86,7 +87,7 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
     shareBtn.disabled = !peerId || !ws || ws.readyState !== WebSocket.OPEN || busy || sharing || remoteSharing;
     stopBtn.disabled = !sharing;
     audioModeEl.disabled = busy || sharing;
-    const channelOpen = !!dataChannel && dataChannel.readyState === "open";
+    const channelOpen = !!fileDataChannel && fileDataChannel.readyState === "open";
     fileInput.disabled = !channelOpen || sendingFiles;
     dropEl.setAttribute("aria-disabled", String(!channelOpen || sendingFiles));
     dropEl.style.opacity = channelOpen ? "1" : ".55";
@@ -109,6 +110,27 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
     update();
   }
 
+  function closeFilePeer() {
+    if (fileDataChannel) {
+      try { fileDataChannel.close(); } catch (_) {}
+      fileDataChannel = null;
+    }
+    if (filePc) {
+      try { filePc.close(); } catch (_) {}
+      filePc = null;
+    }
+    filePendingCandidates = [];
+    fileMakingOffer = false;
+    incomingFiles.clear();
+    fileStatus.textContent = "Waiting for peer-to-peer file connection…";
+    update();
+  }
+
+  function closeAllPeers() {
+    closePeer();
+    closeFilePeer();
+  }
+
   function stopLocal(release) {
     if (release) send({ type: "release" });
     if (localStream) {
@@ -122,11 +144,11 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
     update();
   }
 
-  function attachDataChannel(channel) {
-    if (dataChannel && dataChannel !== channel) {
-      try { dataChannel.close(); } catch (_) {}
+  function attachFileDataChannel(channel) {
+    if (fileDataChannel && fileDataChannel !== channel) {
+      try { fileDataChannel.close(); } catch (_) {}
     }
-    dataChannel = channel;
+    fileDataChannel = channel;
     channel.binaryType = "arraybuffer";
     channel.bufferedAmountLowThreshold = 512 * 1024;
     channel.onopen = () => {
@@ -134,7 +156,7 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
       update();
     };
     channel.onclose = () => {
-      if (dataChannel === channel) dataChannel = null;
+      if (fileDataChannel === channel) fileDataChannel = null;
       fileStatus.textContent = "File channel disconnected";
       update();
     };
@@ -173,7 +195,6 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
       video.play().catch(() => setStatus("Screen received · tap Enable audio"));
       setStatus("Receiving screen" + (event.track.kind === "audio" ? " and audio" : ""));
     };
-    connection.ondatachannel = (event) => attachDataChannel(event.channel);
     connection.onconnectionstatechange = () => {
       const state = connection.connectionState;
       if (state === "connected") {
@@ -191,6 +212,83 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
       if (connection.iceConnectionState === "failed") scheduleIceRestart(500);
     };
     return connection;
+  }
+
+  function makeFilePeerConnection() {
+    const connection = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }],
+      bundlePolicy: "max-bundle"
+    });
+    connection.onicecandidate = (event) => {
+      if (event.candidate && peerId) {
+        send({ type: "candidate", channel: "files", to: peerId, payload: event.candidate.toJSON() });
+      }
+    };
+    connection.ondatachannel = (event) => attachFileDataChannel(event.channel);
+    connection.onconnectionstatechange = () => {
+      if (connection.connectionState === "failed" || connection.connectionState === "closed") {
+        fileStatus.textContent = "File connection lost";
+      }
+    };
+    return connection;
+  }
+
+  async function flushFileCandidates() {
+    if (!filePc || !filePc.remoteDescription) return;
+    const queued = filePendingCandidates.splice(0);
+    for (const candidate of queued) {
+      try { await filePc.addIceCandidate(candidate); }
+      catch (error) { console.debug("File ICE candidate", error); }
+    }
+  }
+
+  async function startFileOffer() {
+    if (!peerId || !ws || ws.readyState !== WebSocket.OPEN || fileMakingOffer) return;
+    if (filePc && filePc.signalingState !== "stable") return;
+    fileMakingOffer = true;
+    try {
+      if (filePc) {
+        try { filePc.close(); } catch (_) {}
+      }
+      filePc = makeFilePeerConnection();
+      attachFileDataChannel(filePc.createDataChannel("files", { ordered: true }));
+      const offer = await filePc.createOffer();
+      await filePc.setLocalDescription(offer);
+      send({ type: "offer", channel: "files", to: peerId, payload: filePc.localDescription });
+    } catch (error) {
+      console.error("File connection setup failed", error);
+      fileStatus.textContent = "File connection setup failed";
+    } finally {
+      fileMakingOffer = false;
+    }
+  }
+
+  async function handleFileSignal(message) {
+    if (message.type === "offer") {
+      if (!filePc || filePc.connectionState === "closed") filePc = makeFilePeerConnection();
+      await filePc.setRemoteDescription(message.payload);
+      await flushFileCandidates();
+      const answer = await filePc.createAnswer();
+      await filePc.setLocalDescription(answer);
+      send({ type: "answer", channel: "files", to: message.from, payload: filePc.localDescription });
+    } else if (message.type === "answer") {
+      if (!filePc) return;
+      await filePc.setRemoteDescription(message.payload);
+      await flushFileCandidates();
+    } else if (message.type === "candidate") {
+      if (filePc && filePc.remoteDescription) {
+        try { await filePc.addIceCandidate(message.payload); }
+        catch (error) { console.debug("File ICE candidate", error); }
+      } else {
+        filePendingCandidates.push(message.payload);
+      }
+    }
+  }
+
+  function ensureFileConnection() {
+    if (!peerId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    // Deterministic offerer: the lexicographically smaller client ID initiates.
+    if (clientId < peerId) startFileOffer();
   }
 
   function scheduleIceRestart(delay) {
@@ -220,7 +318,6 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
           const sender = pc.addTrack(track, localStream);
           if (track.kind === "video") await configureVideoSender(sender);
         }
-        attachDataChannel(pc.createDataChannel("files", { ordered: true }));
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
       }
@@ -239,7 +336,8 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
     if (!pc || !pc.remoteDescription) return;
     const queued = pendingCandidates.splice(0);
     for (const candidate of queued) {
-      try { await pc.addIceCandidate(candidate); } catch (error) { console.debug("ICE candidate", error); }
+      try { await pc.addIceCandidate(candidate); }
+      catch (error) { console.debug("ICE candidate", error); }
     }
   }
 
@@ -258,7 +356,8 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
       await flushCandidates();
     } else if (message.type === "candidate") {
       if (pc && pc.remoteDescription) {
-        try { await pc.addIceCandidate(message.payload); } catch (error) { console.debug("ICE candidate", error); }
+        try { await pc.addIceCandidate(message.payload); }
+        catch (error) { console.debug("ICE candidate", error); }
       } else {
         pendingCandidates.push(message.payload);
       }
@@ -267,7 +366,7 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
 
   async function handleMessage(message) {
     if (message.type === "welcome") {
-      myId = message.id;
+      clientId = message.id;
       peerId = (message.peers || [])[0] || null;
       remoteSharing = message.peerRole === "presenter";
       reconnectDelay = 1000;
@@ -284,6 +383,7 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
       } else {
         setStatus(!peerId ? "Waiting for second device…" : remoteSharing ? "Other device is sharing" : "Connected");
       }
+      if (peerId) ensureFileConnection();
       update();
       return;
     }
@@ -291,7 +391,11 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
       const changed = peerId !== message.id || message.type === "peer-reconnected";
       peerId = message.id;
       remoteSharing = message.role === "presenter";
-      if (changed) closePeer();
+      if (changed) {
+        closePeer();
+        closeFilePeer();
+      }
+      ensureFileConnection();
       if (sharing && localStream) await startOffer(false);
       else setStatus(remoteSharing ? "Other device is sharing" : "Connected");
       update();
@@ -301,7 +405,7 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
       if (message.id === peerId) {
         peerId = null;
         remoteSharing = false;
-        closePeer();
+        closeAllPeers();
         setStatus(sharing ? "Peer disconnected · waiting to reconnect…" : "Peer disconnected · waiting for second device…");
       }
       update();
@@ -335,8 +439,13 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
     }
     if (message.type === "peer-missing") setStatus("Peer not connected");
     if (["offer", "answer", "candidate"].includes(message.type) && message.from === peerId) {
-      try { await handleSignal(message); }
-      catch (error) { console.error(error); setStatus("Connection negotiation failed"); }
+      try {
+        if (message.channel === "files") await handleFileSignal(message);
+        else await handleSignal(message);
+      } catch (error) {
+        console.error(error);
+        setStatus("Connection negotiation failed");
+      }
     }
   }
 
@@ -402,7 +511,7 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
   }
 
   async function sendFiles(files) {
-    const channel = dataChannel;
+    const channel = fileDataChannel;
     if (!channel || channel.readyState !== "open" || sendingFiles) return;
     sendingFiles = true;
     update();
@@ -445,7 +554,7 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
       if (message.type === "file-start") {
         if (!Number.isSafeInteger(message.size) || message.size < 0 || message.size > MAX_FILE) {
           fileStatus.textContent = "Rejected oversized file";
-          dataChannel?.send(JSON.stringify({ type: "file-reject", id: message.id }));
+          fileDataChannel?.send(JSON.stringify({ type: "file-reject", id: message.id }));
           return;
         }
         incomingFiles.set(message.id, { name: message.name, size: message.size, mime: message.mime, parts: [], received: 0, sequence: 0 });
@@ -573,17 +682,17 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
   fileInput.addEventListener("change", () => sendFiles(fileInput.files));
   dropEl.addEventListener("click", (event) => {
     if (event.target === fileInput) return;
-    if (dataChannel?.readyState === "open" && !sendingFiles) fileInput.click();
+    if (fileDataChannel?.readyState === "open" && !sendingFiles) fileInput.click();
   });
   dropEl.addEventListener("keydown", (event) => {
-    if ((event.key === "Enter" || event.key === " ") && dataChannel?.readyState === "open" && !sendingFiles) fileInput.click();
+    if ((event.key === "Enter" || event.key === " ") && fileDataChannel?.readyState === "open" && !sendingFiles) fileInput.click();
   });
   dropEl.addEventListener("dragover", (event) => { event.preventDefault(); dropEl.classList.add("drag"); });
   dropEl.addEventListener("dragleave", () => dropEl.classList.remove("drag"));
   dropEl.addEventListener("drop", (event) => {
     event.preventDefault();
     dropEl.classList.remove("drag");
-    if (dataChannel?.readyState === "open" && !sendingFiles) sendFiles(event.dataTransfer.files);
+    if (fileDataChannel?.readyState === "open" && !sendingFiles) sendFiles(event.dataTransfer.files);
   });
 
   document.addEventListener("visibilitychange", () => {
@@ -602,6 +711,7 @@ video{display:block;width:100%;max-height:72vh;aspect-ratio:16/9;object-fit:cont
     clearInterval(heartbeatTimer);
     clearInterval(statsTimer);
     objectUrls.forEach((url) => URL.revokeObjectURL(url));
+    closeAllPeers();
   });
 
   connect();
@@ -741,7 +851,7 @@ export class Room extends DurableObject {
     const target = peers.find((peer) => peer.deserializeAttachment()?.id === message.to);
     if (!target) { try { ws.send(JSON.stringify({ type: "peer-missing" })); } catch (_) {} return; }
     try {
-      target.send(JSON.stringify({ type: message.type, from: session.id, payload: message.payload }));
+      target.send(JSON.stringify({ type: message.type, channel: message.channel === "files" ? "files" : "screen", from: session.id, payload: message.payload }));
     } catch (_) {
       try { ws.send(JSON.stringify({ type: "peer-missing" })); } catch (_) {}
     }
